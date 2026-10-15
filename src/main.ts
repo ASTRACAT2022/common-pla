@@ -228,7 +228,7 @@ function render() {
               <div class="engine-notice">${icon("shield", 15)} <span>${escapeHtml(state.runtime?.note ?? "Движки проверяются на этом устройстве.")}</span></div>
             </section>
 
-            <div class="build-tag"><span class="build-dot"></span> Commonnet Desktop <span>·</span> версия 0.1.3</div>
+            <div class="build-tag"><span class="build-dot"></span> Commonnet Desktop <span>·</span> версия 0.1.4</div>
           </div>
         </section>
       </main>

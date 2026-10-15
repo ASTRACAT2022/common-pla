@@ -89,7 +89,7 @@ try {
   }
 } finally {
   try {
-    await rm(temp, { recursive: true, force: true, maxRetries: 8, retryDelay: 1000 });
+    await rm(temp, { recursive: true, force: true });
   } catch (error) {
     if (
       process.platform !== "win32" ||
@@ -97,7 +97,7 @@ try {
     ) {
       throw error;
     }
-    console.warn("Windows still holds a temporary AmneziaWG build file; the runner will clean it up");
+    console.warn("Windows locked a temporary AmneziaWG build file; leaving it for later cleanup");
   }
 }
 
