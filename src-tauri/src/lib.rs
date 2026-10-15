@@ -1517,7 +1517,7 @@ async fn download_routing_asset(raw_url: &str) -> Result<Vec<u8>, String> {
         .to_owned();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(45))
-        .user_agent("Commonnet-Desktop/0.1.4")
+        .user_agent("Commonnet-Desktop/0.1.5")
         .redirect(Policy::custom(move |attempt: Attempt<'_>| {
             if attempt.previous().len() >= 3
                 || attempt.url().host_str() != Some(original_host.as_str())

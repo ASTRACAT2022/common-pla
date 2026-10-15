@@ -72,7 +72,7 @@ async function buildWindowsAwg(temp) {
     await copyFile(join(client, platform, filename), join(engines, filename));
   }
   await copyFile(join(client, "COPYING"), join(engines, "AMNEZIAWG-WINDOWS-COPYING"));
-  await copyFile(join(client, ".deps/src/COPYING"), join(engines, "AMNEZIAWG-TOOLS-COPYING"));
+  await copyFile(join(client, ".deps/COPYING"), join(engines, "AMNEZIAWG-TOOLS-COPYING"));
   const goSource = join(temp, "amneziawg-go-license");
   await clone("https://github.com/amnezia-vpn/amneziawg-go.git", goVersion, goSource);
   await copyFile(join(goSource, "LICENSE"), join(engines, "AMNEZIAWG-GO-LICENSE"));
