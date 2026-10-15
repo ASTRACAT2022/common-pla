@@ -88,7 +88,17 @@ try {
     throw new Error(`No AmneziaWG engine build configured for ${process.platform}`);
   }
 } finally {
-  await rm(temp, { recursive: true, force: true });
+  try {
+    await rm(temp, { recursive: true, force: true, maxRetries: 8, retryDelay: 1000 });
+  } catch (error) {
+    if (
+      process.platform !== "win32" ||
+      !["EPERM", "EBUSY", "ENOTEMPTY", "EACCES"].includes(error.code)
+    ) {
+      throw error;
+    }
+    console.warn("Windows still holds a temporary AmneziaWG build file; the runner will clean it up");
+  }
 }
 
 console.log(`Built AmneziaWG engines for ${process.platform}-${process.arch}`);
