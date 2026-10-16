@@ -16,6 +16,11 @@ use std::{
     thread,
     time::Duration,
 };
+#[cfg(target_os = "linux")]
+use std::{
+    io::{BufRead, BufReader},
+    process::{ChildStdin, ChildStdout},
+};
 use tauri::{AppHandle, Manager, State};
 use url::Url;
 
@@ -26,6 +31,8 @@ struct AppState {
     profiles: Mutex<Vec<StoredProfile>>,
     active: Mutex<Option<ActiveConnection>>,
     routing: Mutex<Option<RoutingSettings>>,
+    #[cfg(target_os = "linux")]
+    linux_helper: Mutex<Option<LinuxPrivilegedHelper>>,
 }
 
 #[derive(Clone)]
@@ -42,6 +49,75 @@ struct ActiveConnection {
     process: Option<Child>,
     #[cfg(not(target_os = "linux"))]
     external_pid: Option<u32>,
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxPrivilegedHelper {
+    child: Child,
+    input: ChildStdin,
+    output: BufReader<ChildStdout>,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxPrivilegedHelper {
+    fn spawn() -> Result<Self, String> {
+        let executable = std::env::current_exe()
+            .map_err(|_| "Не удалось определить исполняемый файл Commonnet".to_string())?;
+        let mut child = Command::new("pkexec")
+            .arg(executable)
+            .arg("--privileged-helper")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| "Не удалось запросить права через Polkit".to_string())?;
+        let input = child
+            .stdin
+            .take()
+            .ok_or_else(|| "Не удалось открыть канал системного помощника".to_string())?;
+        let mut output = BufReader::new(
+            child
+                .stdout
+                .take()
+                .ok_or_else(|| "Не удалось открыть ответ системного помощника".to_string())?,
+        );
+        let mut ready = String::new();
+        if output.read_line(&mut ready).is_err() || ready.trim() != r#"{"ok":true}"# {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Авторизация отменена или системный помощник не запустился".to_string());
+        }
+        Ok(Self {
+            child,
+            input,
+            output,
+        })
+    }
+
+    fn request(&mut self, request: Value) -> Result<(), String> {
+        writeln!(self.input, "{request}")
+            .and_then(|_| self.input.flush())
+            .map_err(|_| "Потеряна связь с системным помощником".to_string())?;
+        let mut response = String::new();
+        self.output
+            .read_line(&mut response)
+            .map_err(|_| "Не удалось получить ответ системного помощника".to_string())?;
+        let response: Value = serde_json::from_str(&response)
+            .map_err(|_| "Системный помощник вернул неверный ответ".to_string())?;
+        if response["ok"].as_bool() == Some(true) {
+            Ok(())
+        } else {
+            Err(response["error"]
+                .as_str()
+                .unwrap_or("Системная операция не выполнена")
+                .to_string())
+        }
+    }
+
+    fn shutdown(&mut self) {
+        let _ = self.request(serde_json::json!({"op": "shutdown"}));
+        let _ = self.child.wait();
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -442,7 +518,11 @@ fn connect_profile(
                 return Err("Профиль маршрутизации Incy работает с Xray. Выбери сервер Xray для подключения".to_string());
             }
             validate_awg_config(&profile.secret)?;
-            (start_platform_awg(&app, &profile)?, None, None)
+            #[cfg(target_os = "linux")]
+            let config_path = start_platform_awg(&app, &profile, &state)?;
+            #[cfg(not(target_os = "linux"))]
+            let config_path = start_platform_awg(&app, &profile)?;
+            (config_path, None, None)
         }
         "VLESS" | "VMess" | "Trojan" | "Shadowsocks" | "SOCKS" => {
             let config = build_xray_config_with_routing(&profile, routing.as_ref())?;
@@ -450,7 +530,11 @@ fn connect_profile(
                 .as_ref()
                 .map(|routing| routing_asset_dir(&app, routing))
                 .transpose()?;
-            start_platform_xray(&app, &config, assets.as_deref())?
+            #[cfg(target_os = "linux")]
+            let connection = start_platform_xray(&app, &config, assets.as_deref(), &state)?;
+            #[cfg(not(target_os = "linux"))]
+            let connection = start_platform_xray(&app, &config, assets.as_deref())?;
+            connection
         }
         _ => return Err("Этот протокол не поддерживается".to_string()),
     };
@@ -491,7 +575,11 @@ fn disconnect_profile(
         .take()
         .ok_or_else(|| "Активное подключение не найдено".to_string())?;
 
-    if let Err(error) = stop_platform_tunnel(&app, &mut active) {
+    #[cfg(target_os = "linux")]
+    let stop_result = stop_platform_tunnel(&app, &mut active, &state);
+    #[cfg(not(target_os = "linux"))]
+    let stop_result = stop_platform_tunnel(&app, &mut active);
+    if let Err(error) = stop_result {
         *state
             .active
             .lock()
@@ -514,10 +602,16 @@ fn disconnect_profile(
 }
 
 #[cfg(target_os = "linux")]
-fn start_platform_awg(app: &AppHandle, profile: &StoredProfile) -> Result<PathBuf, String> {
+fn start_platform_awg(
+    app: &AppHandle,
+    profile: &StoredProfile,
+    state: &AppState,
+) -> Result<PathBuf, String> {
     let awg_quick = engine_path(app, "awg-quick").ok_or_else(|| {
         "Не найден awg-quick. Установите AmneziaWG tools и повторите попытку".to_string()
     })?;
+    let awg = engine_path(app, "awg")
+        .ok_or_else(|| "Не найден исполняемый файл AmneziaWG".to_string())?;
     let awg_go = engine_path(app, "amneziawg-go")
         .ok_or_else(|| "Не найден движок AmneziaWG. Повторите установку клиента".to_string())?;
     let directory = app
@@ -527,49 +621,34 @@ fn start_platform_awg(app: &AppHandle, profile: &StoredProfile) -> Result<PathBu
         .join("tunnels");
     fs::create_dir_all(&directory)
         .map_err(|_| "Не удалось подготовить файл туннеля".to_string())?;
-    ensure_linux_tun_device()?;
     let config_path = directory.join(format!("{}.conf", profile.summary.id));
     write_private_file(&config_path, &profile.secret)?;
 
-    let result = Command::new("pkexec")
-        .arg("env")
-        .arg(format!(
-            "WG_QUICK_USERSPACE_IMPLEMENTATION={}",
-            awg_go.display()
-        ))
-        .arg(awg_quick)
-        .arg("up")
-        .arg(&config_path)
-        .output()
-        .map_err(|_| "Не удалось запросить права администратора через Polkit".to_string())?;
-    if !result.status.success() {
+    if let Err(error) = run_linux_privileged_action(
+        state,
+        serde_json::json!({
+            "op": "awg_up",
+            "awgQuick": awg_quick,
+            "awg": awg,
+            "awgGo": awg_go,
+            "config": config_path,
+        }),
+    ) {
         let _ = fs::remove_file(&config_path);
-        return Err(
-            if result.status.code() == Some(126) || result.status.code() == Some(127) {
-                "Подключение отменено или не получены права администратора".to_string()
-            } else {
-                "AmneziaWG не смог создать туннель. Проверьте инструменты и конфигурацию"
-                    .to_string()
-            },
-        );
+        return Err(error);
     }
     Ok(config_path)
 }
 
 #[cfg(target_os = "linux")]
-fn stop_linux_awg(app: &AppHandle, config_path: &std::path::Path) -> Result<(), String> {
-    let awg_quick = engine_path(app, "awg-quick")
-        .ok_or_else(|| "Не найден awg-quick для остановки туннеля".to_string())?;
-    let result = Command::new("pkexec")
-        .arg(awg_quick)
-        .arg("down")
-        .arg(config_path)
-        .output()
-        .map_err(|_| "Не удалось запросить права для остановки туннеля".to_string())?;
-    if !result.status.success() {
-        return Err("AmneziaWG не смог остановить туннель".to_string());
-    }
-    Ok(())
+fn stop_linux_awg(config_path: &std::path::Path, state: &AppState) -> Result<(), String> {
+    run_linux_privileged_action(
+        state,
+        serde_json::json!({
+            "op": "awg_down",
+            "config": config_path,
+        }),
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -577,8 +656,8 @@ fn start_platform_xray(
     app: &AppHandle,
     config: &Value,
     asset_dir: Option<&Path>,
+    state: &AppState,
 ) -> Result<(PathBuf, Option<Child>, Option<u32>), String> {
-    use std::os::unix::process::CommandExt;
     let xray = engine_path(app, "xray")
         .ok_or_else(|| "Не найден Xray core. Установите Xray и повторите попытку".to_string())?;
     let directory = app
@@ -598,69 +677,467 @@ fn start_platform_xray(
         return Err(error);
     }
 
-    if let Err(error) = ensure_linux_tun_device() {
+    let assets = asset_dir
+        .unwrap_or_else(|| xray.parent().unwrap_or(&directory))
+        .to_path_buf();
+    if let Err(error) = run_linux_privileged_action(
+        state,
+        serde_json::json!({
+            "op": "xray_up",
+            "xray": xray,
+            "config": config_path,
+            "assets": assets,
+        }),
+    ) {
         let _ = fs::remove_file(&config_path);
         return Err(error);
     }
-
-    let mut command = Command::new("pkexec");
-    command
-        .arg("env")
-        .arg(format!(
-            "XRAY_LOCATION_ASSET={}",
-            asset_dir
-                .unwrap_or_else(|| xray.parent().unwrap_or(&directory))
-                .display()
-        ))
-        .arg(&xray)
-        .args(["run", "-config"])
-        .arg(&config_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0);
-    let mut process = command
-        .spawn()
-        .map_err(|_| "Не удалось запросить права администратора через Polkit".to_string())?;
-    for _ in 0..100 {
-        thread::sleep(Duration::from_millis(200));
-        if let Some(status) = process
-            .try_wait()
-            .map_err(|_| "Не удалось проверить состояние Xray".to_string())?
-        {
-            let _ = fs::remove_file(&config_path);
-            return Err(
-                if status.code() == Some(126) || status.code() == Some(127) {
-                    "Запуск Xray отменён или не получены права администратора".to_string()
-                } else {
-                    "Xray завершился во время запуска туннеля".to_string()
-                },
-            );
-        }
-        if Command::new("ip")
-            .args(["link", "show", "dev", "commonnet0"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-        {
-            return Ok((config_path, Some(process), None));
-        }
-    }
-    stop_xray_process(&mut process);
-    let _ = fs::remove_file(&config_path);
-    Err("Xray не создал сетевой интерфейс за 20 секунд".to_string())
+    Ok((config_path, None, None))
 }
 
 #[cfg(target_os = "linux")]
-fn stop_platform_tunnel(app: &AppHandle, active: &mut ActiveConnection) -> Result<(), String> {
+fn stop_platform_tunnel(
+    _app: &AppHandle,
+    active: &mut ActiveConnection,
+    state: &AppState,
+) -> Result<(), String> {
+    if active.protocol == "AmneziaWG" {
+        stop_linux_awg(&active.config_path, state)?;
+    } else {
+        run_linux_privileged_action(state, serde_json::json!({"op": "xray_down"}))?;
+    }
     if let Some(mut process) = active.process.take() {
         stop_xray_process(&mut process);
-        let _ = fs::remove_file(&active.config_path);
-        return Ok(());
     }
-    stop_linux_awg(app, &active.config_path)?;
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_privileged_action(state: &AppState, request: Value) -> Result<(), String> {
+    let mut helper = state
+        .linux_helper
+        .lock()
+        .map_err(|_| "Не удалось получить системный помощник".to_string())?;
+    if helper.is_none() {
+        *helper = Some(LinuxPrivilegedHelper::spawn()?);
+    }
+    let result = helper
+        .as_mut()
+        .expect("helper initialized")
+        .request(request);
+    if result.is_err()
+        && helper
+            .as_mut()
+            .and_then(|helper| helper.child.try_wait().ok().flatten())
+            .is_some()
+    {
+        *helper = None;
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn privileged_request_path(request: &Value, field: &str) -> Result<PathBuf, String> {
+    let value = request[field]
+        .as_str()
+        .ok_or_else(|| format!("В запросе системному помощнику отсутствует {field}"))?;
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err("Системному помощнику передан неверный путь".to_string());
+    }
+    Ok(path)
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_linux_tun_device_as_root() -> Result<(), String> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let tun_device = Path::new("/dev/net/tun");
+    if tun_device.exists() {
+        return if fs::metadata(tun_device)
+            .is_ok_and(|metadata| metadata.file_type().is_char_device())
+        {
+            Ok(())
+        } else {
+            Err("/dev/net/tun существует, но не является TUN-устройством".to_string())
+        };
+    }
+
+    let _ = Command::new("modprobe").arg("tun").status();
+    fs::create_dir_all("/dev/net")
+        .map_err(|_| "Не удалось создать каталог /dev/net".to_string())?;
+    if !tun_device.exists() {
+        let device = Command::new("mknod")
+            .args(["/dev/net/tun", "c", "10", "200"])
+            .status()
+            .map_err(|_| "Не удалось создать /dev/net/tun".to_string())?;
+        if !device.success() {
+            return Err(
+                "Не удалось подготовить /dev/net/tun. Проверьте модуль ядра TUN".to_string(),
+            );
+        }
+    }
+    let permissions = Command::new("chmod")
+        .args(["600", "/dev/net/tun"])
+        .status()
+        .map_err(|_| "Не удалось настроить права /dev/net/tun".to_string())?;
+    if !permissions.success()
+        || !fs::metadata(tun_device).is_ok_and(|metadata| metadata.file_type().is_char_device())
+    {
+        return Err("Не удалось подготовить /dev/net/tun. Проверьте модуль ядра TUN".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_linux_helper_xray_config(bytes: &[u8]) -> Result<(), String> {
+    let config: Value =
+        serde_json::from_slice(bytes).map_err(|_| "Конфигурация Xray повреждена".to_string())?;
+    let Some(object) = config.as_object() else {
+        return Err("Конфигурация Xray имеет неверный формат".to_string());
+    };
+    if object
+        .keys()
+        .any(|key| !["log", "dns", "inbounds", "outbounds", "routing"].contains(&key.as_str()))
+        || config["log"] != serde_json::json!({"loglevel": "warning"})
+    {
+        return Err("Конфигурация Xray содержит неподдерживаемые системные настройки".to_string());
+    }
+    let Some(inbounds) = config["inbounds"].as_array() else {
+        return Err("В конфигурации Xray отсутствует TUN-интерфейс".to_string());
+    };
+    if inbounds.len() != 1
+        || inbounds[0]["protocol"] != "tun"
+        || inbounds[0]["settings"]["name"] != "commonnet0"
+        || inbounds[0]["settings"]["autoSystemRoutingTable"].is_null()
+    {
+        return Err("Системный помощник разрешает запускать только TUN Commonnet".to_string());
+    }
+    let Some(outbounds) = config["outbounds"].as_array() else {
+        return Err("В конфигурации Xray отсутствует прокси".to_string());
+    };
+    if outbounds.is_empty()
+        || outbounds.iter().any(|outbound| {
+            ![
+                "vless",
+                "vmess",
+                "trojan",
+                "shadowsocks",
+                "socks",
+                "freedom",
+                "blackhole",
+            ]
+            .contains(&outbound["protocol"].as_str().unwrap_or_default())
+        })
+    {
+        return Err("Конфигурация Xray содержит неподдерживаемый выходной протокол".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn write_linux_root_config(file_name: &str, contents: &[u8]) -> Result<PathBuf, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let valid_name = file_name == "xray-active.json"
+        || file_name
+            .strip_prefix("profile-")
+            .and_then(|name| name.strip_suffix(".conf"))
+            .is_some_and(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()));
+    if !valid_name {
+        return Err("Недопустимое имя конфигурации для системного помощника".to_string());
+    }
+    let uid = std::env::var("PKEXEC_UID")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or_else(|| unsafe { libc::getuid() });
+    let directory = PathBuf::from(format!("/run/commonnet-{uid}"));
+    fs::create_dir_all(&directory)
+        .map_err(|_| "Не удалось создать временную системную папку Commonnet".to_string())?;
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+        .map_err(|_| "Не удалось защитить временную системную папку Commonnet".to_string())?;
+    let path = directory.join(file_name);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|_| "Не удалось подготовить системную конфигурацию".to_string())?;
+    if file.write_all(contents).is_err() {
+        let _ = fs::remove_file(&path);
+        return Err("Не удалось сохранить системную конфигурацию".to_string());
+    }
+    Ok(path)
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_privileged_helper_request(
+    request: &Value,
+    xray_process: &mut Option<(Child, PathBuf)>,
+    awg_active: &mut Option<(PathBuf, PathBuf, PathBuf, PathBuf, PathBuf)>,
+) -> Result<bool, String> {
+    match request["op"].as_str().unwrap_or_default() {
+        "awg_up" => {
+            if awg_active.is_some() || xray_process.is_some() {
+                return Err("Системный помощник уже обслуживает активный туннель".to_string());
+            }
+            let awg_quick = privileged_request_path(request, "awgQuick")?;
+            let awg = privileged_request_path(request, "awg")?;
+            let awg_go = privileged_request_path(request, "awgGo")?;
+            let config = privileged_request_path(request, "config")?;
+            if !awg_quick.is_file() || !awg.is_file() || !awg_go.is_file() {
+                return Err("Файлы AmneziaWG не найдены".to_string());
+            }
+            let config_contents = fs::read_to_string(&config)
+                .map_err(|_| "Не удалось прочитать конфигурацию AmneziaWG".to_string())?;
+            validate_awg_config(&config_contents)?;
+            ensure_linux_tun_device_as_root()?;
+            let elevated_config = write_linux_root_config(
+                config
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| "В конфигурации AmneziaWG неверное имя файла".to_string())?,
+                config_contents.as_bytes(),
+            )?;
+            let parent = awg
+                .parent()
+                .ok_or_else(|| "Не удалось найти папку AmneziaWG".to_string())?;
+            let mut search_path = parent.as_os_str().to_os_string();
+            search_path.push(":");
+            search_path.push(std::env::var_os("PATH").unwrap_or_default());
+            let result = Command::new(&awg_quick)
+                .env("WG", &awg)
+                .env("WG_QUICK_USERSPACE_IMPLEMENTATION", &awg_go)
+                .env("PATH", search_path)
+                .arg("up")
+                .arg(&elevated_config)
+                .output();
+            let result = match result {
+                Ok(result) => result,
+                Err(_) => {
+                    let _ = fs::remove_file(&elevated_config);
+                    return Err("Не удалось запустить AmneziaWG".to_string());
+                }
+            };
+            if !result.status.success() {
+                let _ = fs::remove_file(&elevated_config);
+                return Err(
+                    "AmneziaWG не смог создать туннель. Проверьте конфигурацию и TUN".to_string(),
+                );
+            }
+            *awg_active = Some((awg_quick, awg, awg_go, config, elevated_config));
+            Ok(false)
+        }
+        "awg_down" => {
+            let requested_config = privileged_request_path(request, "config")?;
+            let (awg_quick, awg, awg_go, config, elevated_config) = awg_active
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| "Активный туннель AmneziaWG не найден".to_string())?;
+            if requested_config != config {
+                return Err("Запрошена остановка другого профиля AmneziaWG".to_string());
+            }
+            let parent = awg
+                .parent()
+                .ok_or_else(|| "Не удалось найти папку AmneziaWG".to_string())?;
+            let mut search_path = parent.as_os_str().to_os_string();
+            search_path.push(":");
+            search_path.push(std::env::var_os("PATH").unwrap_or_default());
+            let result = Command::new(&awg_quick)
+                .env("WG", &awg)
+                .env("WG_QUICK_USERSPACE_IMPLEMENTATION", &awg_go)
+                .env("PATH", search_path)
+                .arg("down")
+                .arg(&elevated_config)
+                .output()
+                .map_err(|_| "Не удалось остановить AmneziaWG".to_string())?;
+            if !result.status.success() {
+                return Err("AmneziaWG не смог отключить туннель".to_string());
+            }
+            *awg_active = None;
+            let _ = fs::remove_file(&elevated_config);
+            Ok(false)
+        }
+        "xray_up" => {
+            if awg_active.is_some() || xray_process.is_some() {
+                return Err("Системный помощник уже обслуживает активный туннель".to_string());
+            }
+            let xray = privileged_request_path(request, "xray")?;
+            let config = privileged_request_path(request, "config")?;
+            let assets = privileged_request_path(request, "assets")?;
+            if !xray.is_file() {
+                return Err("Файл Xray не найден".to_string());
+            }
+            let config_contents = fs::read(&config)
+                .map_err(|_| "Не удалось прочитать конфигурацию Xray".to_string())?;
+            validate_linux_helper_xray_config(&config_contents)?;
+            ensure_linux_tun_device_as_root()?;
+            let elevated_config = write_linux_root_config("xray-active.json", &config_contents)?;
+            let mut process = Command::new(xray)
+                .env("XRAY_LOCATION_ASSET", assets)
+                .args(["run", "-config"])
+                .arg(&elevated_config)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|_| {
+                    let _ = fs::remove_file(&elevated_config);
+                    "Не удалось запустить Xray с системными правами".to_string()
+                })?;
+            for _ in 0..100 {
+                thread::sleep(Duration::from_millis(200));
+                match process.try_wait() {
+                    Ok(Some(_)) => {
+                        let _ = fs::remove_file(&elevated_config);
+                        return Err("Xray завершился во время запуска туннеля".to_string());
+                    }
+                    Err(_) => {
+                        stop_linux_helper_xray(&mut process);
+                        let _ = fs::remove_file(&elevated_config);
+                        return Err("Не удалось проверить состояние Xray".to_string());
+                    }
+                    _ => {}
+                }
+                if Command::new("ip")
+                    .args(["link", "show", "dev", "commonnet0"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success())
+                {
+                    *xray_process = Some((process, elevated_config));
+                    return Ok(false);
+                }
+            }
+            stop_linux_helper_xray(&mut process);
+            let _ = fs::remove_file(&elevated_config);
+            Err("Xray не создал сетевой интерфейс за 20 секунд".to_string())
+        }
+        "xray_down" => {
+            let (mut process, elevated_config) = xray_process
+                .take()
+                .ok_or_else(|| "Активный процесс Xray не найден".to_string())?;
+            stop_linux_helper_xray(&mut process);
+            let _ = fs::remove_file(elevated_config);
+            Ok(false)
+        }
+        "shutdown" => {
+            if let Some((mut process, elevated_config)) = xray_process.take() {
+                stop_linux_helper_xray(&mut process);
+                let _ = fs::remove_file(elevated_config);
+            }
+            if let Some((awg_quick, awg, awg_go, _config, elevated_config)) = awg_active.take() {
+                let mut search_path = awg
+                    .parent()
+                    .unwrap_or_else(|| Path::new("/usr/bin"))
+                    .as_os_str()
+                    .to_os_string();
+                search_path.push(":");
+                search_path.push(std::env::var_os("PATH").unwrap_or_default());
+                let _ = Command::new(awg_quick)
+                    .env("WG", awg)
+                    .env("WG_QUICK_USERSPACE_IMPLEMENTATION", awg_go)
+                    .env("PATH", search_path)
+                    .arg("down")
+                    .arg(&elevated_config)
+                    .status();
+                let _ = fs::remove_file(elevated_config);
+            }
+            Ok(true)
+        }
+        _ => Err("Системная операция не поддерживается".to_string()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn stop_linux_helper_xray(process: &mut Child) {
+    unsafe {
+        libc::kill(process.id() as i32, libc::SIGTERM);
+    }
+    for _ in 0..25 {
+        if process.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    let _ = process.kill();
+    let _ = process.wait();
+}
+
+#[cfg(target_os = "linux")]
+pub fn run_linux_privileged_helper() -> i32 {
+    use std::io::{BufRead, Write};
+
+    if unsafe { libc::geteuid() } != 0 {
+        return 1;
+    }
+
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::BufWriter::new(std::io::stdout());
+    if writeln!(stdout, "{}", r#"{"ok":true}"#)
+        .and_then(|_| stdout.flush())
+        .is_err()
+    {
+        return 1;
+    }
+    let mut xray_process = None;
+    let mut awg_active = None;
+    for line in stdin.lock().lines() {
+        let Ok(line) = line else {
+            break;
+        };
+        let response = match serde_json::from_str::<Value>(&line) {
+            Ok(request) => match run_linux_privileged_helper_request(
+                &request,
+                &mut xray_process,
+                &mut awg_active,
+            ) {
+                Ok(shutdown) => {
+                    let _ = writeln!(stdout, "{}", r#"{"ok":true}"#);
+                    let _ = stdout.flush();
+                    if shutdown {
+                        return 0;
+                    }
+                    continue;
+                }
+                Err(error) => serde_json::json!({"ok": false, "error": error}),
+            },
+            Err(_) => serde_json::json!({
+                "ok": false,
+                "error": "Системный помощник получил повреждённый запрос"
+            }),
+        };
+        if writeln!(stdout, "{response}")
+            .and_then(|_| stdout.flush())
+            .is_err()
+        {
+            break;
+        }
+    }
+    if let Some((mut process, elevated_config)) = xray_process {
+        stop_linux_helper_xray(&mut process);
+        let _ = fs::remove_file(elevated_config);
+    }
+    if let Some((awg_quick, awg, awg_go, _config, elevated_config)) = awg_active {
+        let mut search_path = awg
+            .parent()
+            .unwrap_or_else(|| Path::new("/usr/bin"))
+            .as_os_str()
+            .to_os_string();
+        search_path.push(":");
+        search_path.push(std::env::var_os("PATH").unwrap_or_default());
+        let _ = Command::new(awg_quick)
+            .env("WG", awg)
+            .env("WG_QUICK_USERSPACE_IMPLEMENTATION", awg_go)
+            .env("PATH", search_path)
+            .arg("down")
+            .arg(&elevated_config)
+            .status();
+        let _ = fs::remove_file(elevated_config);
+    }
+    0
 }
 
 #[cfg(target_os = "macos")]
@@ -843,8 +1320,13 @@ fn start_platform_xray(
         powershell_literal(&pid_path.to_string_lossy()),
     );
     if let Err(error) = run_windows_elevated_script(&command) {
+        let diagnostic = fs::read_to_string(&stderr_path)
+            .or_else(|_| fs::read_to_string(&stdout_path))
+            .ok()
+            .map(|log| windows_log_excerpt(&log))
+            .filter(|log| !log.is_empty());
         let _ = fs::remove_file(&config_path);
-        return Err(error);
+        return Err(diagnostic.map_or(error.clone(), |log| format!("{error}\nXray: {log}")));
     }
     let pid = fs::read_to_string(&pid_path)
         .ok()
@@ -1044,11 +1526,25 @@ fn encode_powershell(script: &str) -> String {
 }
 
 #[cfg(target_os = "windows")]
+fn windows_log_excerpt(log: &str) -> String {
+    let excerpt = log
+        .lines()
+        .rev()
+        .take(12)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    excerpt.chars().take(1800).collect()
+}
+
+#[cfg(target_os = "windows")]
 fn run_windows_elevated_script(script: &str) -> Result<String, String> {
     use std::os::windows::process::CommandExt;
     let encoded_inner = encode_powershell(script);
     let outer = format!(
-        "$p = Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {encoded_inner}' -Verb RunAs -Wait -PassThru -WindowStyle Hidden; exit $p.ExitCode"
+        "try {{ $p = Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {encoded_inner}' -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop; if ($p.ExitCode -ne 0) {{ [Console]::Error.WriteLine('Elevated operation exited with code ' + $p.ExitCode) }}; exit $p.ExitCode }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 1223 }}"
     );
     let encoded_outer = encode_powershell(&outer);
     let output = Command::new("powershell.exe")
@@ -1064,9 +1560,20 @@ fn run_windows_elevated_script(script: &str) -> Result<String, String> {
         .output()
         .map_err(|_| "Не удалось запросить права администратора Windows".to_string())?;
     if !output.status.success() {
-        return Err(
-            "Операция отменена или Windows не предоставила права администратора".to_string(),
-        );
+        let details = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if output.status.code() == Some(1223) {
+            return Err("Запрос прав администратора Windows был отменён".to_string());
+        }
+        let code = output
+            .status
+            .code()
+            .map(|code| format!(" (код {code})"))
+            .unwrap_or_default();
+        return Err(if details.is_empty() {
+            format!("Операция с правами администратора не выполнена{code}")
+        } else {
+            format!("Операция с правами администратора не выполнена{code}: {details}")
+        });
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
@@ -1081,34 +1588,6 @@ fn stop_xray_process(process: &mut Child) {
 }
 
 #[cfg(target_os = "linux")]
-fn ensure_linux_tun_device() -> Result<(), String> {
-    use std::os::unix::fs::FileTypeExt;
-    let tun_device = std::path::Path::new("/dev/net/tun");
-    if tun_device.exists() {
-        return if fs::metadata(tun_device)
-            .is_ok_and(|metadata| metadata.file_type().is_char_device())
-        {
-            Ok(())
-        } else {
-            Err("/dev/net/tun существует, но не является TUN-устройством".to_string())
-        };
-    }
-    let result = Command::new("pkexec")
-        .args([
-            "sh",
-            "-c",
-            "modprobe tun && mkdir -p /dev/net && if [ ! -e /dev/net/tun ]; then mknod /dev/net/tun c 10 200; fi && chmod 600 /dev/net/tun",
-        ])
-        .output()
-        .map_err(|_| "Не удалось запросить права для настройки TUN-устройства".to_string())?;
-    if !result.status.success()
-        || !fs::metadata(tun_device).is_ok_and(|metadata| metadata.file_type().is_char_device())
-    {
-        return Err("Не удалось подготовить /dev/net/tun. Проверьте модуль ядра TUN".to_string());
-    }
-    Ok(())
-}
-
 #[cfg(unix)]
 fn write_private_file(path: &std::path::Path, contents: &str) -> Result<(), String> {
     use std::{fs::OpenOptions, io::Write, os::unix::fs::OpenOptionsExt};
@@ -2278,6 +2757,27 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn privileged_xray_helper_accepts_only_generated_tun_config() {
+        let profile = make_profile(
+            "test-node",
+            "VLESS",
+            "edge.example.test:443".to_string(),
+            "vless://a9e4c1f0-6f15-4a51-8d31-000000000000@edge.example.test:443?security=tls&sni=example.test#test".to_string(),
+        );
+        let config = build_xray_config(&profile).unwrap();
+        let config_bytes = serde_json::to_vec(&config).unwrap();
+        assert!(validate_linux_helper_xray_config(&config_bytes).is_ok());
+
+        let mut unsafe_config = config;
+        unsafe_config["log"]["access"] = Value::String("/root/commonnet-test.log".to_string());
+        assert!(
+            validate_linux_helper_xray_config(&serde_json::to_vec(&unsafe_config).unwrap())
+                .is_err()
+        );
+    }
+
     #[test]
     fn rejects_unknown_xray_transport() {
         let result = build_xray_outbound(
@@ -2538,8 +3038,17 @@ pub fn run() {
             let state = handle.state::<AppState>();
             if let Ok(mut active_guard) = state.active.lock() {
                 if let Some(mut active) = active_guard.take() {
+                    #[cfg(target_os = "linux")]
+                    let _ = stop_platform_tunnel(&handle, &mut active, &state);
+                    #[cfg(not(target_os = "linux"))]
                     let _ = stop_platform_tunnel(&handle, &mut active);
                     let _ = fs::remove_file(active.config_path);
+                }
+            }
+            #[cfg(target_os = "linux")]
+            if let Ok(mut helper) = state.linux_helper.lock() {
+                if let Some(mut helper) = helper.take() {
+                    helper.shutdown();
                 }
             }
         }
