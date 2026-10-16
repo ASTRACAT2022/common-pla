@@ -1,7 +1,7 @@
 {
   "name": "commonnet-desktop",
   "private": true,
-  "version": "0.1.6",
+  "version": "0.1.7",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1420",
@@ -12,7 +12,9 @@
     "engines:all": "npm run engines:xray && npm run engines:platform"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.8.0"
+    "@tauri-apps/api": "^2.8.0",
+    "@tauri-apps/plugin-process": "^2.4.0",
+    "@tauri-apps/plugin-updater": "^2.14.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.8.0",

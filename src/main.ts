@@ -1,4 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check, type Update } from "@tauri-apps/plugin-updater";
 import "./style.css";
 
 type Profile = {
@@ -61,6 +63,7 @@ const escapeHtml = (value: string) =>
 
 const PROFILE_CACHE_KEY = "commonnet.profile-list.v1";
 const SUBSCRIPTION_REFRESH_INTERVAL = 60 * 60 * 1000;
+const APP_UPDATE_CHECK_INTERVAL = 6 * 60 * 60 * 1000;
 
 function isProfile(value: unknown): value is Profile {
   if (typeof value !== "object" || value === null) return false;
@@ -104,6 +107,10 @@ const state: {
   lastSubscriptionUpdate: number | null;
   routingSummary: RoutingSummary | null;
   connection: ConnectionStatus;
+  appUpdate: Update | null;
+  appUpdateInstalling: boolean;
+  appUpdateDismissed: boolean;
+  appUpdateMessage: string;
 } = {
   profiles: cachedProfiles.profiles,
   selectedId: cachedProfiles.selectedId,
@@ -116,6 +123,10 @@ const state: {
   lastSubscriptionUpdate: cachedProfiles.updatedAt,
   routingSummary: null,
   connection: { connected: false, profileId: null, name: null, protocol: null },
+  appUpdate: null,
+  appUpdateInstalling: false,
+  appUpdateDismissed: false,
+  appUpdateMessage: "",
 };
 
 function persistCachedProfiles() {
@@ -177,6 +188,20 @@ function render() {
           <div class="topbar-right"><span class="privacy-badge">${icon("lock", 14)} Данные остаются на устройстве</span><span class="avatar">C</span></div>
         </header>
 
+        ${state.appUpdate && !state.appUpdateDismissed ? `
+          <section class="update-banner" role="status" aria-live="polite">
+            <span class="update-banner-icon">${icon("download", 19)}</span>
+            <div class="update-banner-copy">
+              <strong>Доступно обновление ${escapeHtml(state.appUpdate.version)}</strong>
+              <span>${escapeHtml(state.appUpdateMessage || "Установите новую версию прямо сейчас. Подписка и маршрутизация сохранятся.")}</span>
+            </div>
+            <button class="update-install-button" id="install-app-update" ${state.appUpdateInstalling ? "disabled" : ""}>
+              ${state.appUpdateInstalling ? '<span class="spinner"></span>' : icon("download", 16)}
+              <span>${state.appUpdateInstalling ? "Обновляем…" : "Обновить"}</span>
+            </button>
+            ${state.appUpdateInstalling ? "" : '<button class="update-later-button" id="dismiss-app-update">Позже</button>'}
+          </section>` : ""}
+
         <section class="content-grid">
           <div class="left-column">
             <section class="hero-card">
@@ -228,7 +253,7 @@ function render() {
               <div class="engine-notice">${icon("shield", 15)} <span>${escapeHtml(state.runtime?.note ?? "Движки проверяются на этом устройстве.")}</span></div>
             </section>
 
-            <div class="build-tag"><span class="build-dot"></span> Commonnet Desktop <span>·</span> версия 0.1.6</div>
+            <div class="build-tag"><span class="build-dot"></span> Commonnet Desktop <span>·</span> версия 0.1.7</div>
           </div>
         </section>
       </main>
@@ -334,6 +359,13 @@ function bindEvents() {
   document.querySelector<HTMLButtonElement>("#open-settings")?.addEventListener("click", () => {
     document.querySelector<HTMLDialogElement>("#settings-dialog")?.showModal();
   });
+  document.querySelector<HTMLButtonElement>("#install-app-update")?.addEventListener("click", () => {
+    void installAppUpdate();
+  });
+  document.querySelector<HTMLButtonElement>("#dismiss-app-update")?.addEventListener("click", () => {
+    state.appUpdateDismissed = true;
+    render();
+  });
   document.querySelector<HTMLButtonElement>(".dialog-close")?.addEventListener("click", () => {
     document.querySelector<HTMLDialogElement>("#settings-dialog")?.close();
   });
@@ -393,6 +425,51 @@ function showToast(message: string) {
   toastTimeout = window.setTimeout(() => toast.classList.remove("visible"), 2800);
 }
 
+let appUpdateCheckInFlight = false;
+async function checkForAppUpdate() {
+  if (appUpdateCheckInFlight || state.appUpdateInstalling) return;
+  appUpdateCheckInFlight = true;
+  try {
+    const nextUpdate = await check({ timeout: 20000 });
+    const previousVersion = state.appUpdate?.version ?? null;
+    const wasDismissed = state.appUpdateDismissed;
+    if (state.appUpdate && state.appUpdate !== nextUpdate) await state.appUpdate.close();
+    state.appUpdate = nextUpdate;
+    state.appUpdateDismissed = Boolean(
+      nextUpdate && wasDismissed && nextUpdate.version === previousVersion,
+    );
+    state.appUpdateMessage = "";
+    if (nextUpdate || previousVersion) render();
+  } catch {
+    // Update checks are best-effort; an offline release endpoint must not interrupt VPN use.
+  } finally {
+    appUpdateCheckInFlight = false;
+  }
+}
+
+async function installAppUpdate() {
+  const nextUpdate = state.appUpdate;
+  if (!nextUpdate || state.appUpdateInstalling) return;
+  state.appUpdateInstalling = true;
+  state.appUpdateMessage = "Загружаем и проверяем подпись обновления…";
+  render();
+  try {
+    await nextUpdate.downloadAndInstall((event) => {
+      if (event.event === "Finished") {
+        state.appUpdateMessage = "Устанавливаем обновление…";
+        const message = document.querySelector<HTMLSpanElement>(".update-banner-copy span");
+        if (message) message.textContent = state.appUpdateMessage;
+      }
+    });
+    await relaunch();
+  } catch (error) {
+    state.appUpdateInstalling = false;
+    state.appUpdateMessage = "Не удалось установить обновление. Повторите попытку позже.";
+    render();
+    showToast(String(error));
+  }
+}
+
 async function start() {
   render();
   const [runtimeResult, profilesResult, connectionResult, subscriptionResult, routingResult] = await Promise.allSettled([
@@ -433,6 +510,8 @@ async function start() {
     setFeedback(String(subscriptionResult.reason), "error");
   }
   if (routingResult.status === "rejected") setRoutingFeedback(String(routingResult.reason), "error");
+  void checkForAppUpdate();
+  window.setInterval(() => void checkForAppUpdate(), APP_UPDATE_CHECK_INTERVAL);
 }
 
 void start();

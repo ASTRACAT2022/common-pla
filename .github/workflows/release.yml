@@ -26,41 +26,45 @@ jobs:
             runner: ubuntu-24.04
             bundles: deb,rpm,appimage
             artifact_paths: |
-              src-tauri/target/release/bundle/deb/*.deb
-              src-tauri/target/release/bundle/rpm/*.rpm
-              src-tauri/target/release/bundle/appimage/*.AppImage
+              src-tauri/target/release/bundle/deb/*.deb*
+              src-tauri/target/release/bundle/rpm/*.rpm*
+              src-tauri/target/release/bundle/appimage/*.AppImage*
           - name: Linux ARM64
             id: linux-arm64
             runner: ubuntu-24.04-arm
             bundles: deb,rpm,appimage
             artifact_paths: |
-              src-tauri/target/release/bundle/deb/*.deb
-              src-tauri/target/release/bundle/rpm/*.rpm
-              src-tauri/target/release/bundle/appimage/*.AppImage
+              src-tauri/target/release/bundle/deb/*.deb*
+              src-tauri/target/release/bundle/rpm/*.rpm*
+              src-tauri/target/release/bundle/appimage/*.AppImage*
           - name: Windows x64
             id: windows-x64
             runner: windows-2022
             bundles: msi,nsis
             artifact_paths: |
-              src-tauri/target/release/bundle/msi/*.msi
-              src-tauri/target/release/bundle/nsis/*.exe
+              src-tauri/target/release/bundle/msi/*.msi*
+              src-tauri/target/release/bundle/nsis/*.exe*
           - name: Windows ARM64
             id: windows-arm64
             runner: windows-11-arm
             bundles: msi,nsis
             artifact_paths: |
-              src-tauri/target/release/bundle/msi/*.msi
-              src-tauri/target/release/bundle/nsis/*.exe
+              src-tauri/target/release/bundle/msi/*.msi*
+              src-tauri/target/release/bundle/nsis/*.exe*
           - name: macOS Apple Silicon
             id: macos-arm64
             runner: macos-15
             bundles: dmg
-            artifact_paths: src-tauri/target/release/bundle/dmg/*.dmg
+            artifact_paths: |
+              src-tauri/target/release/bundle/dmg/*.dmg
+              src-tauri/target/release/bundle/macos/*.app.tar.gz*
           - name: macOS Intel
             id: macos-x64
             runner: macos-15-intel
             bundles: dmg
-            artifact_paths: src-tauri/target/release/bundle/dmg/*.dmg
+            artifact_paths: |
+              src-tauri/target/release/bundle/dmg/*.dmg
+              src-tauri/target/release/bundle/macos/*.app.tar.gz*
 
     steps:
       - name: Check out source
@@ -99,6 +103,9 @@ jobs:
 
       - name: Build installers
         run: npm run tauri -- build --bundles "${{ matrix.bundles }}"
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
       - name: Upload installers
         uses: actions/upload-artifact@v4
@@ -131,6 +138,58 @@ jobs:
             cp "$file" "release-upload/${artifact}-$(basename "$file")"
           done < <(find release-artifacts -type f -print0)
           test -n "$(find release-upload -type f -print -quit)"
+
+      - name: Build signed updater manifest
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import datetime
+          import json
+          import os
+          from pathlib import Path
+          from urllib.parse import quote
+
+          upload = Path("release-upload")
+          targets = {
+              "installers-linux-x64-": ("linux", "x86_64", [(".AppImage", "appimage"), (".deb", "deb"), (".rpm", "rpm")]),
+              "installers-linux-arm64-": ("linux", "aarch64", [(".AppImage", "appimage"), (".deb", "deb"), (".rpm", "rpm")]),
+              "installers-windows-x64-": ("windows", "x86_64", [(".exe", "nsis"), (".msi", "msi")]),
+              "installers-windows-arm64-": ("windows", "aarch64", [(".exe", "nsis"), (".msi", "msi")]),
+              "installers-macos-x64-": ("darwin", "x86_64", [(".app.tar.gz", "app")]),
+              "installers-macos-arm64-": ("darwin", "aarch64", [(".app.tar.gz", "app")]),
+          }
+          platforms = {}
+          repository = os.environ["GITHUB_REPOSITORY"]
+          tag = os.environ["RELEASE_TAG"]
+          for prefix, (system, arch, formats) in targets.items():
+              for signature_path in upload.glob(prefix + "*"):
+                  if not signature_path.name.endswith(".sig"):
+                      continue
+                  asset_name = signature_path.name[:-4]
+                  bundle_type = next((kind for suffix, kind in formats if asset_name.endswith(suffix)), None)
+                  if bundle_type is None:
+                      continue
+                  asset_path = upload / asset_name
+                  if not asset_path.is_file():
+                      raise SystemExit(f"Missing updater bundle for {signature_path.name}")
+                  key = f"{system}-{arch}-{bundle_type}"
+                  platforms[key] = {
+                      "url": f"https://github.com/{repository}/releases/download/{quote(tag, safe='')}/{quote(asset_name, safe='')}",
+                      "signature": signature_path.read_text(encoding="utf-8").strip(),
+                  }
+
+          if not platforms:
+              raise SystemExit("No signed updater artifacts found; check repository signing secrets and build outputs")
+
+          manifest = {
+              "version": tag.removeprefix("v"),
+              "notes": f"Commonnet Desktop {tag}",
+              "pub_date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              "platforms": platforms,
+          }
+          (upload / "latest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
       - name: Create release and attach installers
         uses: softprops/action-gh-release@v2

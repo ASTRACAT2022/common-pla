@@ -1,6 +1,6 @@
 [package]
 name = "commonnet-desktop"
-version = "0.1.6"
+version = "0.1.7"
 description = "Commonnet cross-platform desktop client"
 authors = ["Commonnet"]
 edition = "2024"
@@ -19,4 +19,6 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
+tauri-plugin-process = "=2.4.0"
+tauri-plugin-updater = { version = "=2.14.0", default-features = false, features = ["rustls-tls", "system-proxy"] }
 url = "2"

@@ -5,3 +5,4 @@ src-tauri/gen/
 src-tauri/resources/engines/*
 !src-tauri/resources/engines/.gitkeep
 .DS_Store
+*.key
